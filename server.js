@@ -2,9 +2,9 @@
 require('dotenv').config(); // Load environment variables from .env file
 const express = require('express');
 const cors = require('cors');
-const bodyParser = require('body-parser');
 const axios = require('axios'); // For making HTTP requests to Paystack API
 const crypto = require('crypto');
+const nodemailer = require('nodemailer');
 const admin = require('firebase-admin');
 
 // --- Firebase Admin Initialization ---
@@ -18,6 +18,18 @@ if (!admin.apps.length) {
 }
 const firestoreDb = admin.firestore();
 
+// --- Nodemailer Transporter Setup ---
+// Use environment variables for email credentials
+const transporter = nodemailer.createTransport({
+  host: process.env.EMAIL_HOST,
+  port: parseInt(process.env.EMAIL_PORT || '587', 10),
+  secure: parseInt(process.env.EMAIL_PORT || '587', 10) === 465, // true for 465, false for other ports
+  auth: {
+    user: process.env.EMAIL_USER,
+    pass: process.env.EMAIL_PASS,
+  },
+});
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const PAYSTACK_SECRET_KEY = process.env.PAYSTACK_SECRET_KEY;
@@ -25,22 +37,43 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`; // For production, set this in your hosting environment
 
 // Middleware
-// Add your live frontend URL to the whitelist for production
-const whitelist = ['http://localhost:5173', FRONTEND_URL];
+// --- CORS Configuration ---
+const primaryFrontendUrl = process.env.FRONTEND_URL;
+const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
+
+// Build a more robust whitelist using a Set to handle unique URLs
+const whitelist = new Set(['http://localhost:5173']); // Add local dev environment
+
+if (primaryFrontendUrl) {
+  whitelist.add(primaryFrontendUrl); // Add primary live URL from env
+}
+
+// If a Firebase project ID is provided, also add the secondary Firebase domain
+if (firebaseProjectId) {
+  whitelist.add(`https://${firebaseProjectId}.firebaseapp.com`);
+}
+
 const corsOptions = {
   origin: function (origin, callback) {
-    // Allow requests with no origin (like mobile apps or curl requests)
-    if (!origin) return callback(null, true);
-    
-    if (whitelist.indexOf(origin) !== -1) {
+    // Allow requests with no origin (like Postman, mobile apps, or server-to-server)
+    // or if the origin is in our whitelist.
+    if (!origin || whitelist.has(origin)) {
       callback(null, true);
     } else {
+      console.error(`CORS Error: The request from origin '${origin}' was blocked. Whitelist contains: ${[...whitelist].join(', ')}`);
       callback(new Error('Not allowed by CORS'));
     }
   }
 };
 app.use(cors(corsOptions));
-app.use(bodyParser.json()); // To parse JSON request bodies
+// We need the raw body for webhook verification, and the parsed body for other routes.
+// The 'verify' option of express.json allows us to capture the raw body before it's parsed.
+app.use(express.json({
+  verify: (req, res, buf) => {
+    // Save the raw body to a new property on the request object
+    req.rawBody = buf.toString();
+  }
+}));
 
 // --- API Endpoints ---
 
@@ -99,7 +132,8 @@ app.post('/api/paystack/initialize', async (req, res) => {
 // This is more reliable for order fulfillment than the callback_url.
 app.post('/api/paystack/webhook', async (req, res) => {
   // IMPORTANT: Validate the webhook signature to ensure the request is from Paystack
-  const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(JSON.stringify(req.body)).digest('hex');
+  // Use the rawBody for the HMAC signature verification, which we captured in the express.json() middleware
+  const hash = crypto.createHmac('sha512', PAYSTACK_SECRET_KEY).update(req.rawBody).digest('hex');
   if (hash !== req.headers['x-paystack-signature']) {
     console.warn('Webhook received with invalid signature.');
     return res.sendStatus(401); // Unauthorized
@@ -148,8 +182,21 @@ app.post('/api/paystack/webhook', async (req, res) => {
       const cartRef = firestoreDb.collection(`artifacts/${app_id}/users/${user_id}/cart`).doc('currentCart');
       await cartRef.set({ items: [] });
       console.log(`Webhook: Cart cleared for user ${user_id}.`);
+
+      // 3. Send order confirmation email
+      const orderDataForEmail = {
+        orderId: order_id,
+        customerEmail: transactionData.customer.email,
+        customerName: JSON.parse(shipping_info).name,
+        items: JSON.parse(cart_items),
+        totalPrice: transactionData.amount / 100,
+        shippingInfo: JSON.parse(shipping_info),
+      };
+      await sendOrderConfirmationEmail(orderDataForEmail);
+
     } catch (error) {
       console.error(`Webhook: Error processing order ${order_id}:`, error);
+      // Even if email fails, we send 200 so Paystack doesn't retry. The order is already saved.
     }
   }
 
@@ -206,6 +253,60 @@ app.get('/api/paystack/verify', async (req, res) => {
   }
 });
 
+// --- Email Sending Function ---
+async function sendOrderConfirmationEmail(order) {
+  const itemsHtml = order.items.map(item => `
+    <tr>
+      <td style="padding: 8px; border-bottom: 1px solid #ddd;">${item.name} (x${item.quantity})</td>
+      <td style="padding: 8px; border-bottom: 1px solid #ddd; text-align: right;">GHC ${(item.price * item.quantity).toFixed(2)}</td>
+    </tr>
+  `).join('');
+
+  const mailOptions = {
+    from: `"Awuzat Import" <${process.env.EMAIL_USER}>`,
+    to: order.customerEmail,
+    subject: `Your Order Confirmation (ID: ${order.orderId.substring(0, 8)})`,
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #333;">
+        <h2 style="color: #0d47a1;">Thank you for your order, ${order.customerName}!</h2>
+        <p>We've received your order and will process it shortly. Here are the details:</p>
+        <h3>Order ID: ${order.orderId}</h3>
+        <table style="width: 100%; border-collapse: collapse;">
+          <thead>
+            <tr>
+              <th style="padding: 8px; border-bottom: 2px solid #ddd; text-align: left;">Item</th>
+              <th style="padding: 8px; border-bottom: 2px solid #ddd; text-align: right;">Price</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${itemsHtml}
+          </tbody>
+          <tfoot>
+            <tr>
+              <td style="padding: 8px; font-weight: bold; text-align: right;">Total:</td>
+              <td style="padding: 8px; font-weight: bold; text-align: right;">GHC ${order.totalPrice.toFixed(2)}</td>
+            </tr>
+          </tfoot>
+        </table>
+        <h3 style="margin-top: 20px;">Shipping to:</h3>
+        <p>
+          ${order.shippingInfo.name}<br>
+          ${order.shippingInfo.address}<br>
+          ${order.shippingInfo.city}, ${order.shippingInfo.zip}
+        </p>
+        <p>Thank you for shopping with us!</p>
+      </div>
+    `,
+  };
+
+  try {
+    await transporter.sendMail(mailOptions);
+    console.log(`Confirmation email sent successfully to ${order.customerEmail}`);
+  } catch (error) {
+    console.error(`Error sending confirmation email to ${order.customerEmail}:`, error);
+    // Note: Do not block the main process for email failure. Log it for follow-up.
+  }
+}
 
 // Basic route for testing server status
 app.get('/', (req, res) => {
