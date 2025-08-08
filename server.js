@@ -37,35 +37,6 @@ const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:5173';
 const BACKEND_URL = process.env.BACKEND_URL || `http://localhost:${PORT}`; // For production, set this in your hosting environment
 
 // Middleware
-// --- CORS Configuration ---
-const primaryFrontendUrl = process.env.FRONTEND_URL;
-const firebaseProjectId = process.env.FIREBASE_PROJECT_ID;
-
-// Build a more robust whitelist using a Set to handle unique URLs
-const whitelist = new Set(['http://localhost:5173']); // Add local dev environment
-
-if (primaryFrontendUrl) {
-  whitelist.add(primaryFrontendUrl); // Add primary live URL from env
-}
-
-// If a Firebase project ID is provided, also add the secondary Firebase domain
-if (firebaseProjectId) {
-  whitelist.add(`https://${firebaseProjectId}.firebaseapp.com`);
-}
-
-const corsOptions = {
-  origin: function (origin, callback) {
-    // Allow requests with no origin (like Postman, mobile apps, or server-to-server)
-    // or if the origin is in our whitelist.
-    if (!origin || whitelist.has(origin)) {
-      callback(null, true);
-    } else {
-      console.error(`CORS Error: The request from origin '${origin}' was blocked. Whitelist contains: ${[...whitelist].join(', ')}`);
-      callback(new Error('Not allowed by CORS'));
-    }
-  }
-};
-app.use(cors(corsOptions));
 // We need the raw body for webhook verification, and the parsed body for other routes.
 // The 'verify' option of express.json allows us to capture the raw body before it's parsed.
 app.use(express.json({
